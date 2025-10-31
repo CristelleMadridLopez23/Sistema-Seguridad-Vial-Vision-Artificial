@@ -1,1 +1,5 @@
 *.npz
+*.pt
+*.h5
+*.keras
+*.weights
