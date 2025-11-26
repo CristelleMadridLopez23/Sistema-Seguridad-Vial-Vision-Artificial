@@ -1,115 +1,163 @@
-import tensorflow as tf
+import torch
+import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import random
+from pykalman import KalmanFilter
 
 # --- CONFIGURACIÓN ---
-MODEL_FILE = "lstm_trajectory_predictor.h5"
-TEST_DATA_FILE = "test_lstm_sequences.npz"
+MODEL_FILE = "best_lstm_model.pth"  # El archivo generado por el script de PyTorch
+TEST_DATA_FILE = "data/test_lstm_sequences.npz" # Asegúrate de tener este archivo o usa val_lstm_sequences.npz para probar
 
-# Parámetros definidos en la fase de secuencias:
-T_HIST = 20  # Timesteps de Input (Historia)
-T_PRED = 10  # Timesteps de Output (Futuro)
+# Parámetros (Deben coincidir con los del entrenamiento)
+T_HIST = 20  
+T_PRED = 10  
+FEATURES = 2 
+HIDDEN_DIM = 128
 
+# Configurar dispositivo
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- 1. DEFINICIÓN DE LA CLASE (Necesaria para cargar los pesos) ---
+class TrajectoryPredictor(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, pred_len):
+        super(TrajectoryPredictor, self).__init__()
+        self.pred_len = pred_len
+        self.encoder = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.decoder = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        _, (h_n, c_n) = self.encoder(x)
+        context_vector = h_n[-1]
+        decoder_input = context_vector.unsqueeze(1).repeat(1, self.pred_len, 1)
+        decoder_out, _ = self.decoder(decoder_input, (h_n, c_n))
+        predictions = self.fc(decoder_out)
+        return predictions
+
+# --- 2. HELPER: KALMAN FILTER ---
+def apply_kalman_smoothing(dataset_X):
+    print(f"   -> Aplicando Kalman a {len(dataset_X)} muestras de prueba...")
+    smoothed_dataset = np.zeros_like(dataset_X)
+    kf = KalmanFilter(initial_state_mean=np.zeros(2), n_dim_obs=2)
+    
+    # Procesamos una muestra (sample) aleatoria para mostrar progreso si son muchos datos
+    for i in range(len(dataset_X)):
+        kf.initial_state_mean = dataset_X[i, 0, :]
+        (smoothed_means, _) = kf.smooth(dataset_X[i])
+        smoothed_dataset[i] = smoothed_means
+    return smoothed_dataset
 
 def run_evaluation():
-    """Carga el modelo y los datos de prueba para calcular la precisión y hacer una predicción de muestra."""
-    
-    # 1. Cargar el Modelo Entrenado
-    print(f"Cargando modelo: {MODEL_FILE}...")
+    # 1. Cargar el Modelo
+    print(f"Cargando estructura del modelo y pesos de: {MODEL_FILE}...")
     try:
-        model = tf.keras.models.load_model(MODEL_FILE, compile=False)
-        model.compile(optimizer='adam', loss='mse')  # Compilar para evaluación
-    except Exception as e:
-        print(f"🚨 ERROR al cargar el modelo. Asegúrate que '{MODEL_FILE}' existe.")
-        print(f"Detalle: {e}")
+        model = TrajectoryPredictor(FEATURES, HIDDEN_DIM, FEATURES, T_PRED)
+        
+        # Cargar los pesos (map_location asegura que cargue en CPU si no hay GPU)
+        model.load_state_dict(torch.load(MODEL_FILE, map_location=device))
+        model.to(device)
+        model.eval() # IMPORTANTE: Modo evaluación (congela dropout, etc.)
+        print(" Modelo cargado exitosamente.")
+        
+    except FileNotFoundError:
+        print(f" ERROR: No se encontró '{MODEL_FILE}'. Ejecuta el entrenamiento primero.")
         return
 
-    # 2. Cargar los Datos de Prueba
+    # 2. Cargar Datos de Prueba
     print(f"Cargando datos de prueba: {TEST_DATA_FILE}...")
     try:
         data_test = np.load(TEST_DATA_FILE)
-        X_test = data_test['X']
+        X_test_raw = data_test['X']
         Y_test = data_test['Y']
-        print(f"Datos de prueba cargados. Total de muestras: {X_test.shape[0]}")
+        
+        # APLICAR KALMAN (Crucial: El modelo aprendió con datos suaves, debe recibir datos suaves)
+        X_test = apply_kalman_smoothing(X_test_raw)
+        
+        print(f"Datos cargados. Muestras: {X_test.shape[0]}")
+        
     except FileNotFoundError:
-        print(f"🚨 ERROR: No se encontró el archivo de prueba '{TEST_DATA_FILE}'.")
+        print(f" ERROR: No se encontró '{TEST_DATA_FILE}'. ¿Quizás quieres probar con 'val_lstm_sequences.npz'?")
         return
 
     # ----------------------------------------------------
-    # I. PRUEBA CUANTITATIVA (Métrica de Precisión)
+    # I. PRUEBA CUANTITATIVA
     # ----------------------------------------------------
     print("\n--- I. EVALUACIÓN CUANTITATIVA (MSE) ---")
     
-    # Calcular el Error Cuadrático Medio (MSE) en todo el conjunto de prueba
-    mse = model.evaluate(X_test, Y_test, verbose=1)
+    # Convertir todo el set a Tensores para evaluación rápida
+    X_tensor = torch.from_numpy(X_test).float().to(device)
+    Y_tensor = torch.from_numpy(Y_test).float().to(device)
     
-    # El MSE está en coordenadas NORMALIZADAS (0 a 1).
-    # Para convertirlo a píxeles, asumiremos el tamaño de video (1280x720) y tomamos el promedio.
-    # Usaremos el error promedio de desplazamiento por fotograma (Root Mean Squared Error o RMSE).
+    criterion = nn.MSELoss()
     
-    # RMSE Normalizado: Raíz cuadrada del MSE
-    rmse_norm = np.sqrt(mse)
+    with torch.no_grad():
+        predictions = model(X_tensor)
+        mse_loss = criterion(predictions, Y_tensor).item()
     
-    # Error promedio en píxeles (estimación rápida, asumiendo un ancho de 1280)
-    # El MSE es la suma de los errores cuadrados de X e Y. Multiplicar por el ancho promedio
-    # convierte este error normalizado de nuevo a un error aproximado en píxeles.
-    ERROR_PIXELS_EST = (rmse_norm * 1280 + rmse_norm * 720) / 2 # Estima el error de la coordenada promedio
+    rmse_norm = np.sqrt(mse_loss)
+    # Estimación en píxeles (asumiendo frame 1280x720)
+    ERROR_PIXELS_EST = (rmse_norm * 1280 + rmse_norm * 720) / 2 
 
-    print(f"\nResultados de Evaluación:")
-    print(f"  MSE (Error Cuadrático Medio, Normalizado): {mse:.6f}")
-    print(f"  RMSE (Raíz del MSE, Normalizado): {rmse_norm:.6f}")
-    print(f"  Error de Predicción Estimado (Píxeles promedio): ~{ERROR_PIXELS_EST:.2f} píxeles")
-    
+    print(f"Resultados:")
+    print(f"  MSE (Normalizado):  {mse_loss:.6f}")
+    print(f"  RMSE (Normalizado): {rmse_norm:.6f}")
+    print(f"  Error Estimado:     ~{ERROR_PIXELS_EST:.2f} píxeles")
+
     # ----------------------------------------------------
-    # II. PRUEBA CUALITATIVA (Visualización de la Predicción)
+    # II. PRUEBA CUALITATIVA (Visualización)
     # ----------------------------------------------------
-    print("\n--- II. PRUEBA CUALITATIVA (Comparación de Trayectoria) ---")
+    print("\n--- II. PRUEBA CUALITATIVA ---")
     
-    # Seleccionar una muestra de prueba aleatoria
-    sample_index = random.randint(0, X_test.shape[0] - 1)
-    X_sample = X_test[sample_index:sample_index + 1] # Historia (Input)
+    # Seleccionar muestra aleatoria
+    idx = random.randint(0, X_test.shape[0] - 1)
+    
+    # Preparar inputs individuales
+    # Necesitamos dimensión batch: (1, 20, 2)
+    X_sample_tensor = X_tensor[idx].unsqueeze(0) 
+    
+    # Predecir
+    with torch.no_grad():
+        Y_pred_tensor = model(X_sample_tensor)
+    
+    # Convertir a Numpy para graficar (traer de GPU a CPU si es necesario)
+    # Usamos X_test_raw para graficar la historia original (con ruido) o X_test (suave) según prefieras.
+    # Usaré X_test (suave) para ver qué "vió" el modelo.
+    history_plot = X_test[idx] 
+    y_true_plot = Y_test[idx]
+    y_pred_plot = Y_pred_tensor.cpu().numpy()[0] # Quitar dimensión batch
 
-    # Predecir el futuro con el modelo
-    Y_pred = model.predict(X_sample)[0]
+    # Crear trayectorias completas para conectar las líneas
+    # Conectamos el último punto de la historia con el primero de la predicción
+    last_hist_point = history_plot[-1].reshape(1, 2)
     
-    # Obtener la verdad fundamental (Ground Truth) para la muestra
-    Y_true = Y_test[sample_index]
-    
-    # Concatenar historia, predicción REAL y predicción MODELO para la gráfica
-    # Tiempos: [T_HIST] Historia | [T_PRED] Futuro Real | [T_PRED] Futuro Predicho
-    
-    # Trayectoria Real Completa: Historia + Futuro Real
-    full_true_trajectory = np.concatenate([X_sample[0], Y_true], axis=0)
-    
-    # Trayectoria Predicha: Historia + Futuro Predicho
-    full_pred_trajectory = np.concatenate([X_sample[0], Y_pred], axis=0)
+    full_true = np.concatenate([last_hist_point, y_true_plot], axis=0)
+    full_pred = np.concatenate([last_hist_point, y_pred_plot], axis=0)
 
-    # Graficar la trayectoria
+    # Gráfica
     plt.figure(figsize=(10, 8))
     
-    # Trazar la historia (puntos en común)
-    plt.plot(X_sample[0][:, 0], X_sample[0][:, 1], 'k--', label='Historia (Input)', linewidth=2) 
+    # 1. Historia
+    plt.plot(history_plot[:, 0], history_plot[:, 1], 'k--', label='Historia (Input Kalman)', linewidth=2)
     
-    # Trazar la predicción REAL (Futuro)
-    plt.plot(full_true_trajectory[:, 0], full_true_trajectory[:, 1], 'g-', label='Futuro Real (Ground Truth)', linewidth=2)
-    plt.scatter(Y_true[:, 0], Y_true[:, 1], c='g', marker='o') # Puntos futuros reales
+    # 2. Futuro Real
+    plt.plot(full_true[:, 0], full_true[:, 1], 'g-', label='Futuro Real', linewidth=2)
+    plt.scatter(y_true_plot[:, 0], y_true_plot[:, 1], c='g', s=30)
     
-    # Trazar la predicción del MODELO (Futuro)
-    plt.plot(full_pred_trajectory[:, 0], full_pred_trajectory[:, 1], 'r-', label='Predicción del Modelo', linewidth=2, alpha=0.7)
-    plt.scatter(Y_pred[:, 0], Y_pred[:, 1], c='r', marker='x') # Puntos futuros predichos
+    # 3. Predicción
+    plt.plot(full_pred[:, 0], full_pred[:, 1], 'r-', label='Predicción Modelo', linewidth=2)
+    plt.scatter(y_pred_plot[:, 0], y_pred_plot[:, 1], c='r', marker='x', s=50)
 
-    # Marcar el punto de inicio de la predicción (fin de la historia)
-    plt.scatter(X_sample[0][-1, 0], X_sample[0][-1, 1], c='k', marker='D', s=100, label='Punto de Predicción (T=0)')
+    # Punto actual
+    plt.scatter(history_plot[-1, 0], history_plot[-1, 1], c='blue', marker='o', s=100, label='Vehículo Actual')
 
-    plt.title(f"Comparación de Trayectorias (Muestra {sample_index})")
-    plt.xlabel("Coordenada X Normalizada")
-    plt.ylabel("Coordenada Y Normalizada")
+    plt.title(f"Predicción de Trayectoria (Muestra {idx})")
+    plt.xlabel("X Normalizada")
+    plt.ylabel("Y Normalizada")
     plt.legend()
-    plt.grid(True)
-    plt.gca().invert_yaxis() # Los píxeles Y aumentan hacia abajo
+    plt.grid(True, alpha=0.3)
+    plt.gca().invert_yaxis() # Coordenadas de imagen
     plt.show()
 
-# --- EJECUCIÓN PRINCIPAL ---
 if __name__ == "__main__":
     run_evaluation()
